@@ -48,9 +48,16 @@ class RangeDatasource(Datasource):
         if self._n == 0:
             target_rows_per_block = 0
         else:
-            row_size_bytes = self.estimate_inmemory_data_size() // self._n
-            row_size_bytes = max(row_size_bytes, 1)
-            target_rows_per_block = max(1, ctx.target_max_block_size // row_size_bytes)
+            # Derive rows-per-block. If target_max_block_size is ``None``,
+            # treat it as unlimited and avoid further splitting.
+            if ctx.target_max_block_size is None:
+                target_rows_per_block = n  # whole block in one shot
+            else:
+                row_size_bytes = self.estimate_inmemory_data_size() // self._n
+                row_size_bytes = max(row_size_bytes, 1)
+                target_rows_per_block = max(
+                    1, ctx.target_max_block_size // row_size_bytes
+                )
 
         # Example of a read task. In a real datasource, this would pull data
         # from an external system instead of generating dummy data.
