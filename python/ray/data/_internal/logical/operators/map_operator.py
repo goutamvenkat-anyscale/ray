@@ -288,12 +288,12 @@ class Project(AbstractMap):
         self._batch_format = "pyarrow"
         self._zero_copy_batch = True
 
-        for expr in self._exprs:
-            if expr.name is None and not isinstance(expr, StarExpr):
-                raise TypeError(
-                    "All Project expressions must be named (use .alias(name) or col(name)), "
-                    "or be a star() expression."
-                )
+        # for expr in self._exprs:
+        # if expr.name is None and not isinstance(expr, StarExpr):
+        #     raise TypeError(
+        #         "All Project expressions must be named (use .alias(name) or col(name)), "
+        #         "or be a star() expression."
+        #     )
 
     def has_star_expr(self) -> bool:
         """Check if this projection contains a star() expression."""

@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 import logging
 import operator
-from typing import Any, Callable, Dict, List, TypeVar, Union
+from typing import Any, Callable, Dict, List, Tuple, TypeVar, Union
 
 import numpy as np
 import pandas as pd
@@ -20,6 +20,7 @@ from ray.data.expressions import (
     Expr,
     LiteralExpr,
     Operation,
+    RenameExpr,
     StarExpr,
     UDFExpr,
     UnaryExpr,
@@ -648,7 +649,18 @@ class NativeExpressionEvaluator(_ExprVisitor[Union[BlockColumn, ScalarType]]):
             A Block with the data from the inner expression.
         """
         # Evaluate the inner expression
-        return self.visit(expr.expr)
+        col = self.visit(expr.expr)
+
+        self.block = BlockAccessor.for_block(self.block).fill_column(expr.name, col)
+
+        return col
+
+    def visit_rename(self, expr: RenameExpr) -> Union[BlockColumn, ScalarType]:
+        self.visit(expr.expr)
+
+        self.block = self.block.rename_columns({expr.prev_name: expr.new_name})
+
+        return self.block[expr.new_name]
 
     def visit_star(self, expr: StarExpr) -> Union[BlockColumn, ScalarType]:
         """Visit a star expression.
@@ -679,7 +691,7 @@ class NativeExpressionEvaluator(_ExprVisitor[Union[BlockColumn, ScalarType]]):
         )
 
 
-def eval_expr(expr: Expr, block: Block) -> Union[BlockColumn, ScalarType]:
+def eval_expr(expr: Expr, block: Block) -> Tuple[Union[BlockColumn, ScalarType], Block]:
     """Evaluate an expression against a block using the visitor pattern.
 
     Args:
@@ -690,7 +702,7 @@ def eval_expr(expr: Expr, block: Block) -> Union[BlockColumn, ScalarType]:
         The evaluated result as a BlockColumn or a scalar value.
     """
     evaluator = NativeExpressionEvaluator(block)
-    return evaluator.visit(expr)
+    return evaluator.visit(expr), evaluator.block
 
 
 def eval_projection(exprs: List[Expr], block: Block) -> Block:
@@ -716,8 +728,6 @@ def eval_projection(exprs: List[Expr], block: Block) -> Block:
     if block_accessor.num_rows() == 0 and len(block_accessor.column_names()) == 0:
         return block
 
-    existing_cols = list(block_accessor.column_names())
-
     # Handle simple cases early.
     if len(exprs) == 0:
         return block_accessor.select([])
@@ -725,43 +735,21 @@ def eval_projection(exprs: List[Expr], block: Block) -> Block:
     if len(exprs) == 1 and isinstance(exprs[0], StarExpr):
         return block
 
-    # Helper function to check if expression is a simple rename of existing column.
-    def is_simple_rename(expr: Expr) -> bool:
-        return isinstance(expr, AliasExpr) and expr.expr.name in existing_cols
-
-    # Build rename map: src_name -> dest_name for simple renames.
-    rename_map: Dict[str, str] = {}
-    for expr in exprs:
-        if is_simple_rename(expr) and expr.expr.name != expr.name:
-            rename_map[expr.expr.name] = expr.name
-
     # Expand stars to determine output column order.
-    non_star_exprs = [e for e in exprs if not isinstance(e, StarExpr)]
-    output_order: List[str] = []
-    for expr in exprs:
-        if isinstance(expr, StarExpr):
-            output_order.extend(rename_map.get(c, c) for c in existing_cols)
-        else:
-            output_order.append(expr.name)
+    from pprint import pprint
 
-    # Determine which source columns should be dropped in final output.
-    # ANY alias where src != dest should drop 'src' if no later expression outputs 'src'.
-    drop_sources: set[str] = set()
-    for idx, expr in enumerate(non_star_exprs):
-        # Check if this is ANY alias (not just simple renames of existing cols)
-        if isinstance(expr, AliasExpr):
-            src = expr.expr.name
-            dest = expr.name
-            if src != dest:
-                # Check if any expression AFTER this one outputs the source name.
-                if not any(e.name == src for e in non_star_exprs[idx + 1 :]):
-                    drop_sources.add(src)
+    pprint(exprs)
 
     # Evaluate expressions sequentially.
     cur_block = block
     seen_outputs = set()
+    output_columns = set()
 
-    for expr in non_star_exprs:
+    for expr in exprs:
+        if isinstance(expr, StarExpr):
+            if len(output_columns) == 0:
+                output_columns.update(BlockAccessor.for_block(cur_block).column_names())
+            continue
         output_name = expr.name
 
         # Check for duplicate output names.
@@ -769,18 +757,210 @@ def eval_projection(exprs: List[Expr], block: Block) -> Block:
             raise ValueError(f"Column name '{output_name}' is a duplicate.")
         seen_outputs.add(output_name)
 
-        # Simple renames evaluate against original block to preserve swap semantics.
-        # Other expressions evaluate against current block to access prior outputs.
-        source_block = block if is_simple_rename(expr) else cur_block
-        value = eval_expr(expr, source_block)
-        cur_block = BlockAccessor.for_block(cur_block).fill_column(output_name, value)
+        value, residual_block = eval_expr(expr, cur_block)
+        cur_block: Block = BlockAccessor.for_block(residual_block).fill_column(
+            output_name, value
+        )
+        import polars as pl
 
-    # Build final column list: deduplicate output_order and exclude dropped sources.
-    final_cols: List[str] = []
-    seen_final = set()
-    for name in output_order:
-        if name not in drop_sources and name not in seen_final:
-            final_cols.append(name)
-            seen_final.add(name)
+        # pprint(f"processing expr: {expr}")
+        pretty_print_expr(expr, indent=2)
+        print()
+        print(f"cur block: {pl.from_arrow(cur_block)}")
+        print(f"output name: {output_name}")
+        output_columns.add(output_name)
 
-    return BlockAccessor.for_block(cur_block).select(final_cols)
+    print(f"output names: {output_columns}")
+    cur_block_cols = BlockAccessor.for_block(cur_block).column_names()
+    return BlockAccessor.for_block(cur_block).select(
+        list(set(cur_block_cols) & output_columns)
+    )
+
+
+def pretty_print_expr(expr, indent=0, prefix="", is_last=True):
+    """
+    Pretty print an expression tree for easier debugging.
+
+    Args:
+        expr: The expression to print
+        indent: Current indentation level (internal use)
+        prefix: Prefix string for tree structure (internal use)
+        is_last: Whether this is the last child (internal use)
+
+    Example:
+        >>> from ray.data.expressions import col, lit
+        >>> expr = (col("x") + 5) * col("y").alias("result")
+        >>> pretty_print_expr(expr)
+    """
+    from ray.data.expressions import (
+        AliasExpr,
+        BinaryExpr,
+        ColumnExpr,
+        DownloadExpr,
+        LiteralExpr,
+        Operation,
+        RenameExpr,
+        StarExpr,
+        UDFExpr,
+        UnaryExpr,
+    )
+
+    # Determine the connector
+    connector = "└── " if is_last else "├── "
+
+    # Print current node with appropriate formatting
+    if isinstance(expr, ColumnExpr):
+        print(f"{prefix}{connector}ColumnExpr: '{expr.name}'")
+
+    elif isinstance(expr, LiteralExpr):
+        value_repr = repr(expr.value)
+        if len(value_repr) > 50:
+            value_repr = value_repr[:50] + "..."
+        print(
+            f"{prefix}{connector}LiteralExpr: {value_repr} (type: {type(expr.value).__name__})"
+        )
+
+    elif isinstance(expr, BinaryExpr):
+        op_name = expr.op.value if isinstance(expr.op, Operation) else str(expr.op)
+        print(f"{prefix}{connector}BinaryExpr: {op_name.upper()}")
+
+        # Print children
+        extension = "    " if is_last else "│   "
+        pretty_print_expr(expr.left, indent + 1, prefix + extension, False)
+        pretty_print_expr(expr.right, indent + 1, prefix + extension, True)
+
+    elif isinstance(expr, UnaryExpr):
+        op_name = expr.op.value if isinstance(expr.op, Operation) else str(expr.op)
+        print(f"{prefix}{connector}UnaryExpr: {op_name.upper()}")
+
+        # Print operand
+        extension = "    " if is_last else "│   "
+        pretty_print_expr(expr.operand, indent + 1, prefix + extension, True)
+
+    elif isinstance(expr, AliasExpr):
+        print(f"{prefix}{connector}AliasExpr: '{expr.name}'")
+
+        # Print the underlying expression
+        extension = "    " if is_last else "│   "
+        pretty_print_expr(expr.expr, indent + 1, prefix + extension, True)
+
+    elif isinstance(expr, UDFExpr):
+        fn_name = getattr(expr.fn, "__name__", "<lambda>")
+        print(f"{prefix}{connector}UDFExpr: {fn_name}")
+
+        extension = "    " if is_last else "│   "
+
+        # Print positional args
+        if expr.args:
+            print(f"{prefix}{extension}├── args:")
+            for i, arg in enumerate(expr.args):
+                is_last_arg = (i == len(expr.args) - 1) and not expr.kwargs
+                pretty_print_expr(
+                    arg, indent + 2, prefix + extension + "│   ", is_last_arg
+                )
+
+        # Print keyword args
+        if expr.kwargs:
+            print(f"{prefix}{extension}└── kwargs:")
+            kw_items = list(expr.kwargs.items())
+            for i, (key, value) in enumerate(kw_items):
+                is_last_kw = i == len(kw_items) - 1
+                kw_prefix = "└── " if is_last_kw else "├── "
+                kw_extension = "    " if is_last_kw else "│   "
+                print(f"{prefix}{extension}    {kw_prefix}{key}:")
+                pretty_print_expr(
+                    value, indent + 3, prefix + extension + "    " + kw_extension, True
+                )
+
+    elif isinstance(expr, DownloadExpr):
+        print(f"{prefix}{connector}DownloadExpr: uri_column='{expr.uri_column_name}'")
+
+    elif isinstance(expr, StarExpr):
+        print(f"{prefix}{connector}StarExpr: *")
+
+    elif isinstance(expr, RenameExpr):
+        print(f"{prefix}{connector}RenameExpr: '{expr.prev_name}' -> '{expr.new_name}'")
+
+        # Print the underlying expression
+        extension = "    " if is_last else "│   "
+        pretty_print_expr(expr.expr, indent + 1, prefix + extension, True)
+
+    else:
+        print(f"{prefix}{connector}Unknown Expression Type: {type(expr).__name__}")
+
+
+# Simpler alternative that returns a string
+def expr_to_string(expr, indent=0):
+    """
+    Convert an expression tree to a compact string representation.
+
+    Args:
+        expr: The expression to convert
+        indent: Current indentation level
+
+    Returns:
+        String representation of the expression tree
+    """
+    from ray.data.expressions import (
+        AliasExpr,
+        BinaryExpr,
+        ColumnExpr,
+        DownloadExpr,
+        LiteralExpr,
+        Operation,
+        RenameExpr,
+        StarExpr,
+        UDFExpr,
+        UnaryExpr,
+    )
+
+    ind = "  " * indent
+
+    if isinstance(expr, ColumnExpr):
+        return f"{ind}col('{expr.name}')"
+
+    elif isinstance(expr, LiteralExpr):
+        return f"{ind}lit({repr(expr.value)})"
+
+    elif isinstance(expr, BinaryExpr):
+        op_name = expr.op.value if isinstance(expr.op, Operation) else str(expr.op)
+        left_str = expr_to_string(expr.left, indent + 1)
+        right_str = expr_to_string(expr.right, indent + 1)
+        return f"{ind}{op_name.upper()}(\n{left_str},\n{right_str}\n{ind})"
+
+    elif isinstance(expr, UnaryExpr):
+        op_name = expr.op.value if isinstance(expr.op, Operation) else str(expr.op)
+        operand_str = expr_to_string(expr.operand, indent + 1)
+        return f"{ind}{op_name.upper()}(\n{operand_str}\n{ind})"
+
+    elif isinstance(expr, AliasExpr):
+        expr_str = expr_to_string(expr.expr, indent + 1)
+        return f"{ind}alias('{expr.name}',\n{expr_str}\n{ind})"
+
+    elif isinstance(expr, UDFExpr):
+        fn_name = getattr(expr.fn, "__name__", "<lambda>")
+        args_str = ",\n".join([expr_to_string(arg, indent + 1) for arg in expr.args])
+        if expr.kwargs:
+            kwargs_str = ",\n".join(
+                [
+                    f"{ind}  {k}={expr_to_string(v, indent + 1).lstrip()}"
+                    for k, v in expr.kwargs.items()
+                ]
+            )
+            return f"{ind}{fn_name}(\n{args_str},\n{kwargs_str}\n{ind})"
+        return f"{ind}{fn_name}(\n{args_str}\n{ind})"
+
+    elif isinstance(expr, DownloadExpr):
+        return f"{ind}download('{expr.uri_column_name}')"
+
+    elif isinstance(expr, StarExpr):
+        return f"{ind}star()"
+
+    elif isinstance(expr, RenameExpr):
+        expr_str = expr_to_string(expr.expr, indent + 1)
+        return (
+            f"{ind}rename('{expr.prev_name}' -> '{expr.new_name}',\n{expr_str}\n{ind})"
+        )
+
+    else:
+        return f"{ind}<{type(expr).__name__}>"

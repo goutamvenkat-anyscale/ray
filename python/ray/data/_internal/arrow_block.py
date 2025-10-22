@@ -463,7 +463,7 @@ class ArrowBlockAccessor(TableBlockAccessor):
         )
 
         # Evaluate the expression to get a boolean mask
-        mask = eval_expr(predicate_expr, self._table)
+        mask, _ = eval_expr(predicate_expr, self._table)
 
         # Use PyArrow's built-in filter method
         return self._table.filter(mask)

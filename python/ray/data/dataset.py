@@ -112,6 +112,7 @@ from ray.data.context import DataContext
 from ray.data.datasource import Connection, Datasink, FilenameProvider, SaveMode
 from ray.data.datasource.datasink import WriteResult, _gen_datasink_write_result
 from ray.data.datasource.file_datasink import _FileDatasink
+from ray.data.expressions import RenameExpr
 from ray.data.iterator import DataIterator
 from ray.data.random_access_dataset import RandomAccessDataset
 from ray.types import ObjectRef
@@ -1175,7 +1176,7 @@ class Dataset:
                     "rename_columns requires both keys and values in the 'names' "
                     "to be strings."
                 )
-            exprs = [col(old).alias(new) for old, new in names.items()]
+            exprs = [RenameExpr(col(old), old, new) for old, new in names.items()]
 
         elif isinstance(names, list):
             if not names:
@@ -1201,7 +1202,7 @@ class Dataset:
                 )
 
             exprs = [
-                col(old).alias(new)
+                RenameExpr(col(old), old, new)
                 for old, new in dict(zip(current_names, names)).items()
             ]
         else:

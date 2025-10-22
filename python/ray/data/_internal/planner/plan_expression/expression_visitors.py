@@ -6,6 +6,7 @@ from ray.data.expressions import (
     ColumnExpr,
     Expr,
     LiteralExpr,
+    RenameExpr,
     StarExpr,
     UDFExpr,
     UnaryExpr,
@@ -88,6 +89,11 @@ class _ColumnReferenceCollector(_ExprVisitorBase):
         """Visit a download expression (no columns to collect)."""
         pass
 
+    def visit_rename(self, expr: RenameExpr) -> None:
+        """Visit a rename expression and collect columns from its inner expression."""
+        # Visit the inner expression to collect the actual column references
+        self.visit(expr.expr)
+
 
 class _ColumnRewriter(_ExprVisitor[Expr]):
     """Visitor that rewrites column references in expression trees.
@@ -139,6 +145,14 @@ class _ColumnRewriter(_ExprVisitor[Expr]):
         self._currently_substituting.add(expr.name)
 
         try:
+            # Handle RenameExpr: treat as aliased column for substitution purposes
+            # RenameExpr(col('a'), 'a', 'x') in substitution means "use col 'a' as 'x'"
+            if isinstance(substitution, RenameExpr):
+                # Recursively visit the inner expression to unwrap any nested renames
+                base_expr = self.visit(substitution.expr)
+                # Re-alias to preserve the renamed name (this is the OUTPUT name)
+                return base_expr.alias(substitution.new_name)
+
             if not isinstance(substitution, AliasExpr):
                 # Non-aliased expression: recursively rewrite
                 return self.visit(substitution)
@@ -242,3 +256,56 @@ class _ColumnRewriter(_ExprVisitor[Expr]):
             The original star expression.
         """
         return expr
+
+    def visit_rename(self, expr: RenameExpr) -> Expr:
+        """Visit a rename expression and rewrite its inner expression.
+
+        Key behavior:
+        - If renaming a column that's already renamed (chained renames), flatten to a
+          single rename from the original base column
+        - If renaming a computed column, inline the computation as an aliased expression
+
+        Args:
+            expr: The rename expression.
+
+        Returns:
+            A new rename expression with rewritten inner expression, or an aliased
+            expression if the substitution is a computed value.
+        """
+
+        if expr.prev_name in self.column_substitutions:
+            substitution = self.column_substitutions[expr.prev_name]
+
+            # Case 1: Chained rename - flatten to single rename
+            # Example: x=RenameExpr(col('a'), 'a', 'x'), then RenameExpr(col('x'), 'x', 'y')
+            # Should become: RenameExpr(col('a'), 'a', 'y')
+            if isinstance(substitution, RenameExpr):
+                # Get the base column from the chain
+                base_expr = self.visit(substitution.expr)
+                return RenameExpr(
+                    expr=base_expr,
+                    prev_name=base_expr.name
+                    if isinstance(base_expr, ColumnExpr)
+                    else substitution.prev_name,
+                    new_name=expr.new_name,
+                )
+
+            # Case 2: Renaming a computed column - convert to aliased expression
+            # Example: sum=(a+b).alias('sum'), then RenameExpr(col('sum'), 'sum', 'total')
+            # Should become: (a+b).alias('total')
+            else:
+                # Recursively rewrite the substitution to resolve any column references
+                rewritten = self.visit(substitution)
+                # Return as aliased expression with the new name
+                if isinstance(rewritten, AliasExpr):
+                    # If already aliased, re-alias with the new name
+                    return self.visit(rewritten.expr).alias(expr.new_name)
+                else:
+                    return rewritten.alias(expr.new_name)
+        else:
+            # No substitution found - rewrite the inner expression
+            return RenameExpr(
+                expr=self.visit(expr.expr),
+                prev_name=expr.prev_name,
+                new_name=expr.new_name,
+            )

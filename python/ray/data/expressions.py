@@ -83,6 +83,8 @@ class _ExprVisitor(ABC, Generic[T]):
             return self.visit_download(expr)
         elif isinstance(expr, StarExpr):
             return self.visit_star(expr)
+        elif isinstance(expr, RenameExpr):
+            return self.visit_rename(expr)
         else:
             raise TypeError(f"Unsupported expression type for conversion: {type(expr)}")
 
@@ -116,6 +118,10 @@ class _ExprVisitor(ABC, Generic[T]):
 
     @abstractmethod
     def visit_download(self, expr: "DownloadExpr") -> T:
+        pass
+
+    @abstractmethod
+    def visit_rename(self, expr: "RenameExpr") -> T:
         pass
 
 
@@ -721,6 +727,31 @@ class StarExpr(Expr):
 
     def structurally_equals(self, other: Any) -> bool:
         return isinstance(other, StarExpr)
+
+
+@DeveloperAPI(stability="alpha")
+@dataclass(frozen=True, eq=False)
+class RenameExpr(Expr):
+    """Expression that represents a rename operation."""
+
+    expr: Expr
+
+    prev_name: str
+    new_name: str
+
+    # TODO: Add UnresolvedExpr. Both StarExpr and UnresolvedExpr won't have a defined data_type.
+    data_type: DataType = field(default_factory=lambda: DataType(object), init=False)
+
+    @property
+    def name(self) -> str:
+        return self.new_name
+
+    def structurally_equals(self, other: Any) -> bool:
+        return (
+            isinstance(other, RenameExpr)
+            and self.expr.structurally_equals(other.expr)
+            and self._name == other._name
+        )
 
 
 @PublicAPI(stability="beta")

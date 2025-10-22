@@ -58,69 +58,6 @@ def _extract_simple_rename(expr: Expr) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _analyze_upstream_project(
-    upstream_project: Project,
-) -> Tuple[Set[str], dict[str, Expr], Set[str]]:
-    """
-    Analyze what the upstream project produces and identifies removed columns.
-
-    Example: Upstream exprs [col("x").alias("y")] → removed_by_renames = {"x"} if "x" not in output
-    """
-    output_columns = {
-        expr.name for expr in upstream_project.exprs if not isinstance(expr, StarExpr)
-    }
-    column_definitions = {
-        expr.name: expr
-        for expr in upstream_project.exprs
-        if not isinstance(expr, StarExpr)
-    }
-
-    # Identify columns removed by renames (source not in output)
-    removed_by_renames: Set[str] = set()
-    for expr in upstream_project.exprs:
-        if isinstance(expr, StarExpr):
-            continue
-        rename_pair = _extract_simple_rename(expr)
-        if rename_pair is not None:
-            source_name, _ = rename_pair
-            if source_name not in output_columns:
-                removed_by_renames.add(source_name)
-
-    return output_columns, column_definitions, removed_by_renames
-
-
-def _validate_fusion(
-    downstream_project: Project,
-    upstream_has_all: bool,
-    upstream_output_columns: Set[str],
-    removed_by_renames: Set[str],
-) -> bool:
-    """
-    Validate if fusion is possible without rewriting expressions.
-    Returns True if all expressions can be fused, False otherwise.
-
-    Example: Downstream refs "x" but upstream renamed "x" to "y" and dropped "x" → False
-    """
-    for expr in downstream_project.exprs:
-        if isinstance(expr, StarExpr):
-            continue
-
-        referenced_columns = _collect_referenced_columns([expr]) or set()
-        columns_from_original = referenced_columns - (
-            referenced_columns & upstream_output_columns
-        )
-
-        # Validate accessibility
-        if not upstream_has_all and columns_from_original:
-            # Example: Upstream selects ["a", "b"], Downstream refs "c" → can't fuse
-            return False  # Downstream needs columns not in upstream output
-        if any(col in removed_by_renames for col in columns_from_original):
-            # Example: Upstream renames "x" to "y" (dropping "x"), Downstream refs "x" → can't fuse
-            return False  # Downstream needs a removed column
-
-    return True
-
-
 def _compose_projects(
     upstream_project: Project,
     downstream_project: Project,
@@ -137,23 +74,7 @@ def _compose_projects(
     - Rename-of-computed columns will be dropped from final output by the evaluator
       when there's no later explicit mention of the source name.
     """
-    fused_exprs: List[Expr] = []
-
-    # Include star only if upstream had star; otherwise, don't reintroduce dropped cols.
-    if upstream_has_star:
-        fused_exprs.append(StarExpr())
-
-    # Then upstream non-star expressions in order.
-    for expr in upstream_project.exprs:
-        if not isinstance(expr, StarExpr):
-            fused_exprs.append(expr)
-
-    # Then downstream non-star expressions in order.
-    for expr in downstream_project.exprs:
-        if not isinstance(expr, StarExpr):
-            fused_exprs.append(expr)
-
-    return fused_exprs
+    return upstream_project.exprs + downstream_project.exprs
 
 
 def _try_fuse_consecutive_projects(
@@ -167,26 +88,15 @@ def _try_fuse_consecutive_projects(
     upstream_has_star: bool = upstream_project.has_star_expr()
     downstream_has_star: bool = downstream_project.has_star_expr()
 
-    # Analyze upstream
-    (
-        upstream_output_columns,
-        upstream_column_definitions,
-        removed_by_renames,
-    ) = _analyze_upstream_project(upstream_project)
-
-    # Validate fusion possibility
-    if not _validate_fusion(
-        downstream_project,
-        upstream_has_star,
-        upstream_output_columns,
-        removed_by_renames,
-    ):
-        return None
-
     rewritten_exprs: List[Expr] = []
     # Intersection case: This is when downstream is a selection (no star), and we need to recursively rewrite the downstream expressions into the upstream column definitions.
     # Example: Upstream: [col("a").alias("b")], Downstream: [col("b").alias("c")] → Rewritten: [col("a").alias("c")]
     if not downstream_has_star:
+        upstream_column_definitions = {
+            expr.name: expr
+            for expr in upstream_project.exprs
+            if not isinstance(expr, StarExpr)
+        }
         for expr in downstream_project.exprs:
             rewritten = _ColumnRewriter(upstream_column_definitions).visit(expr)
             rewritten_exprs.append(rewritten)
@@ -220,11 +130,14 @@ class ProjectionPushdown(Rule):
     def apply(self, plan: LogicalPlan) -> LogicalPlan:
         """Apply projection pushdown optimization to the entire plan."""
         dag = plan.dag
-        new_dag = dag._apply_transform(self._optimize_project)
+
+        new_dag = dag._apply_transform(self._try_fuse_projects)
+        new_dag = new_dag._apply_transform(self._try_push_projection_into_read_op)
+
         return LogicalPlan(new_dag, plan.context) if dag is not new_dag else plan
 
     @classmethod
-    def _optimize_project(cls, op: LogicalOperator) -> LogicalOperator:
+    def _try_fuse_projects(cls, op: LogicalOperator) -> LogicalOperator:
         """
         Optimize a single Project operator.
 
@@ -237,29 +150,40 @@ class ProjectionPushdown(Rule):
 
         # Step 1: Iteratively fuse with upstream Project operations
         current_project: Project = op
-        while isinstance(current_project.input_dependency, Project):
-            upstream_project: Project = current_project.input_dependency  # type: ignore[assignment]
-            fused_project = _try_fuse_consecutive_projects(
-                upstream_project, current_project
-            )
-            if fused_project is None:
-                # Fusion not possible, stop iterating
-                break
-            current_project = fused_project
+
+        if not isinstance(current_project.input_dependency, Project):
+            return op
+
+        upstream_project: Project = current_project.input_dependency  # type: ignore[assignment]
+        return _try_fuse_consecutive_projects(upstream_project, current_project)
+
+    @classmethod
+    def _try_push_projection_into_read_op(cls, op: LogicalOperator) -> LogicalOperator:
+        if not isinstance(op, Project):
+            return op
+
+        project: Project = op
 
         # Step 2: Push projection into the data source if supported
-        input_op = current_project.input_dependency
+        input_op = project.input_dependency
+
         if (
-            not current_project.has_star_expr()  # Must be a selection, not additive
+            not project.has_star_expr()  # Must be a selection, not additive
             and isinstance(input_op, LogicalOperatorSupportsProjectionPushdown)
             and input_op.supports_projection_pushdown()
         ):
-            required_columns = _collect_referenced_columns(list(current_project.exprs))
+            from pprint import pprint
+
+            pprint(f">>> [DBG] current project: {project.exprs}")
+
+            required_columns = _collect_referenced_columns(list(project.exprs))
+
             if required_columns is not None:  # None means star() was present
+                print(f"required columns: {required_columns}")
                 optimized_source = input_op.apply_projection(list(required_columns))
 
                 is_simple_selection = all(
-                    isinstance(expr, ColumnExpr) for expr in current_project.exprs
+                    isinstance(expr, ColumnExpr) for expr in project.exprs
                 )
 
                 if is_simple_selection:
@@ -269,8 +193,8 @@ class ProjectionPushdown(Rule):
                     # Has transformations: Keep Project on top of optimized Read
                     return Project(
                         optimized_source,
-                        exprs=current_project.exprs,
-                        ray_remote_args=current_project._ray_remote_args,
+                        exprs=project.exprs,
+                        ray_remote_args=project._ray_remote_args,
                     )
 
-        return current_project
+        return project
