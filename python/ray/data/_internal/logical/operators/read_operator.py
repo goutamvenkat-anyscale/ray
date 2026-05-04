@@ -279,6 +279,10 @@ class ReadFiles(
         object.__setattr__(self, "_input_dependencies", [input_op])
         object.__setattr__(self, "_num_outputs", None)
 
+    @property
+    def input_dependency(self) -> LogicalOperator:
+        return self.input_dependencies[0]
+
     def _apply_transform(
         self, transform: "Callable[[LogicalOperator], LogicalOperator]"
     ) -> LogicalOperator:
