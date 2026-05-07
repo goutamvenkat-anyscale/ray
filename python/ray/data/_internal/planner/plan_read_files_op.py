@@ -54,6 +54,7 @@ def plan_read_files_op(
     # NOTE: Avoid capturing the whole ``op`` in closures — only field values.
     scanner = op.scanner
     renames = op.column_renames
+    block_udf = op.block_udf
 
     def do_read(blocks: Iterable[Block], _: TaskContext) -> Iterable[Block]:
         reader = scanner.create_reader()
@@ -69,6 +70,11 @@ def plan_read_files_op(
             if len(manifest) == 0:
                 continue
             for table in reader.read(manifest):
+                # Apply caller-supplied block transform before renames so
+                # the UDF sees the original on-disk column names, matching
+                # V1 ``ParquetDatasource`` semantics.
+                if block_udf is not None:
+                    table = block_udf(table)
                 yield _DatasourceProjectionPushdownMixin._apply_rename(table, renames)
 
     return MapOperator.create(
