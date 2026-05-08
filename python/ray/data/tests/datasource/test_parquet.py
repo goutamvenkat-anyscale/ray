@@ -126,9 +126,10 @@ def test_include_paths_with_column_projection(
     table = pa.Table.from_pydict({"animals": ["cat", "dog"], "id": [1, 2]})
     pq.write_table(table, path)
 
-    # Under V1, ``include_paths=True`` implicitly retained ``path`` through
-    # ``.select_columns``. V2 respects ``.select_columns`` literally — the
-    # caller must include ``"path"`` explicitly when they want it.
+    # V2 ``select_columns`` is literal — ``"path"`` is dropped unless listed.
+    # V1 ``read_parquet(columns=[...], include_paths=True)`` retained ``"path"``
+    # automatically; the ``columns=`` deprecation message in ``read_api`` calls
+    # this out so callers know to thread ``"path"`` through their projection.
     ds = ray.data.read_parquet(path, include_paths=True).select_columns(["id", "path"])
 
     schema_names = ds.schema().names
@@ -1188,8 +1189,8 @@ def test_parquet_roundtrip(
     assert read_data == written_data
 
     # Test metadata ops.
-    for block, meta in ds2._plan.execute().blocks:
-        BlockAccessor.for_block(ray.get(block)).size_bytes() == meta.size_bytes
+    for block, meta in ds2._execute().blocks:
+        BlockAccessor.for_block(ray.get(block)).size_bytes() == meta.size_bytes  # type: ignore[call-overload]
 
     if fs is None:
         shutil.rmtree(path)
@@ -2846,7 +2847,6 @@ def test_fsspec_filesystem(ray_start_regular_shared, tmp_path):
     ds = ray.data.read_parquet([path1, path2], filesystem=fs)
 
     # Test metadata-only parquet ops.
-    assert not ds.has_started_execution
     assert ds.count() == 6
 
     out_path = os.path.join(tmp_path, "out")

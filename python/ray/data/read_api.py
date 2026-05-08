@@ -78,7 +78,6 @@ from ray.data._internal.logical.operators import (
     Read,
     ReadFiles,
 )
-from ray.data._internal.plan import ExecutionPlan
 from ray.data._internal.remote_fn import cached_remote_fn
 from ray.data._internal.stats import DatasetStats
 from ray.data._internal.tensor_extensions.utils import _create_possibly_ragged_ndarray
@@ -159,15 +158,10 @@ def from_blocks(blocks: List[Block]):
     meta_with_schema = [BlockMetadataWithSchema.from_block(block) for block in blocks]
 
     from_blocks_op = FromBlocks(block_refs, meta_with_schema)
-    execution_plan = ExecutionPlan(
-        DatasetStats(metadata={"FromBlocks": meta_with_schema}, parent=None),
-        DataContext.get_current().copy(),
-    )
-    logical_plan = LogicalPlan(from_blocks_op, execution_plan._context)
-    return MaterializedDataset(
-        execution_plan,
-        logical_plan,
-    )
+    stats = DatasetStats(metadata={"FromBlocks": meta_with_schema}, parent=None)
+    context = DataContext.get_current().copy()
+    logical_plan = LogicalPlan(from_blocks_op, context)
+    return MaterializedDataset(logical_plan, context, stats)
 
 
 @PublicAPI
@@ -256,15 +250,10 @@ def from_items(
         )
 
     from_items_op = FromItems(blocks, meta_with_schema)
-    execution_plan = ExecutionPlan(
-        DatasetStats(metadata={"FromItems": meta_with_schema}, parent=None),
-        DataContext.get_current().copy(),
-    )
-    logical_plan = LogicalPlan(from_items_op, execution_plan._context)
-    return MaterializedDataset(
-        execution_plan,
-        logical_plan,
-    )
+    stats = DatasetStats(metadata={"FromItems": meta_with_schema}, parent=None)
+    context = DataContext.get_current().copy()
+    logical_plan = LogicalPlan(from_items_op, context)
+    return MaterializedDataset(logical_plan, context, stats)
 
 
 @PublicAPI
@@ -580,9 +569,14 @@ def _read_datasource_v2(
     )
 
     stats = DatasetStats(metadata={"Read": []}, parent=None)
-    execution_plan = ExecutionPlan(stats, DataContext.get_current().copy())
-    logical_plan = LogicalPlan(read_op, execution_plan._context)
-    return Dataset(plan=execution_plan, logical_plan=logical_plan)
+    context = DataContext.get_current().copy()
+    logical_plan = LogicalPlan(read_op, context)
+
+    return Dataset(
+        logical_plan=logical_plan,
+        context=context,
+        in_stats=stats,
+    )
 
 
 @PublicAPI
@@ -712,15 +706,9 @@ def read_datasource(
         ray_remote_args=ray_remote_args,
         compute=compute_strategy,
     )
-    execution_plan = ExecutionPlan(
-        stats,
-        DataContext.get_current().copy(),
-    )
-    logical_plan = LogicalPlan(read_op, execution_plan._context)
-    return Dataset(
-        plan=execution_plan,
-        logical_plan=logical_plan,
-    )
+    context = DataContext.get_current().copy()
+    logical_plan = LogicalPlan(read_op, context)
+    return Dataset(logical_plan, context, stats)
 
 
 @PublicAPI(stability="alpha")
@@ -1316,13 +1304,26 @@ def read_parquet(
         if columns is not None:
             # TODO(datasource-v2): remove `columns=` from `read_parquet` once
             # the projection-pushdown rule dispatches to `ReadFiles`. Callers
-            # should use `ray.data.read_parquet(path).select_columns([...])`
-            # — semantically equivalent on V1, and on V2 the pushdown rule
-            # will fold the projection into the scanner once it lands.
+            # should use `ray.data.read_parquet(path).select_columns([...])`.
+            #
+            # Caveat for the ``include_paths=True`` migration: V1
+            # ``columns=[...]`` implicitly retained the synthetic ``"path"``
+            # column (see ``ParquetDatasource.read_fragments`` /
+            # ``get_current_projection``), but ``select_columns([...])`` is
+            # literal and will drop ``"path"`` unless it's listed explicitly.
+            # Callers passing both must add ``"path"`` to their projection
+            # when migrating; the message below flags that case.
+            hint = (
+                " Note: when combined with `include_paths=True`, V1 implicitly"
+                " retained the `path` column — add `'path'` to your"
+                " `select_columns([...])` list to preserve it."
+                if include_paths
+                else ""
+            )
             raise NotImplementedError(
                 "`columns=` on `read_parquet` is deprecated on the DataSourceV2 "
                 "path. Use `ray.data.read_parquet(path).select_columns([...])` "
-                "instead."
+                "instead." + hint
             )
 
         from ray.data._internal.datasource_v2.parquet_datasource_v2 import (
@@ -3455,34 +3456,20 @@ def from_pandas_refs(
     if context.enable_pandas_block:
         get_metadata_schema = cached_remote_fn(get_table_block_metadata_schema)
         metadata_schema = ray.get([get_metadata_schema.remote(df) for df in dfs])
-        execution_plan = ExecutionPlan(
-            DatasetStats(metadata={"FromPandas": metadata_schema}, parent=None),
-            DataContext.get_current().copy(),
-        )
-        logical_plan = LogicalPlan(
-            FromPandas(dfs, metadata_schema), execution_plan._context
-        )
-        return MaterializedDataset(
-            execution_plan,
-            logical_plan,
-        )
+        stats = DatasetStats(metadata={"FromPandas": metadata_schema}, parent=None)
+        ctx = DataContext.get_current().copy()
+        logical_plan = LogicalPlan(FromPandas(dfs, metadata_schema), ctx)
+        return MaterializedDataset(logical_plan, ctx, stats)
 
     df_to_block = cached_remote_fn(pandas_df_to_arrow_block, num_returns=2)
 
     res = [df_to_block.remote(df) for df in dfs]
     blocks, metadata_schema = map(list, zip(*res))
     metadata_schema = ray.get(metadata_schema)
-    execution_plan = ExecutionPlan(
-        DatasetStats(metadata={"FromPandas": metadata_schema}, parent=None),
-        DataContext.get_current().copy(),
-    )
-    logical_plan = LogicalPlan(
-        FromPandas(blocks, metadata_schema), execution_plan._context
-    )
-    return MaterializedDataset(
-        execution_plan,
-        logical_plan,
-    )
+    stats = DatasetStats(metadata={"FromPandas": metadata_schema}, parent=None)
+    ctx = DataContext.get_current().copy()
+    logical_plan = LogicalPlan(FromPandas(blocks, metadata_schema), ctx)
+    return MaterializedDataset(logical_plan, ctx, stats)
 
 
 @PublicAPI
@@ -3598,19 +3585,10 @@ def from_numpy_refs(
     blocks, metadata_schema = map(list, zip(*res))
     metadata_schema = ray.get(metadata_schema)
 
-    execution_plan = ExecutionPlan(
-        DatasetStats(metadata={"FromNumpy": metadata_schema}, parent=None),
-        DataContext.get_current().copy(),
-    )
-
-    logical_plan = LogicalPlan(
-        FromNumpy(blocks, metadata_schema), execution_plan._context
-    )
-
-    return MaterializedDataset(
-        execution_plan,
-        logical_plan,
-    )
+    stats = DatasetStats(metadata={"FromNumpy": metadata_schema}, parent=None)
+    context = DataContext.get_current().copy()
+    logical_plan = LogicalPlan(FromNumpy(blocks, metadata_schema), context)
+    return MaterializedDataset(logical_plan, context, stats)
 
 
 @PublicAPI
@@ -3753,18 +3731,10 @@ def from_arrow_refs(
 
     get_metadata_schema = cached_remote_fn(get_table_block_metadata_schema)
     metadata_schema = ray.get([get_metadata_schema.remote(t) for t in tables])
-    execution_plan = ExecutionPlan(
-        DatasetStats(metadata={"FromArrow": metadata_schema}, parent=None),
-        DataContext.get_current().copy(),
-    )
-    logical_plan = LogicalPlan(
-        FromArrow(tables, metadata_schema), execution_plan._context
-    )
-
-    return MaterializedDataset(
-        execution_plan,
-        logical_plan,
-    )
+    stats = DatasetStats(metadata={"FromArrow": metadata_schema}, parent=None)
+    context = DataContext.get_current().copy()
+    logical_plan = LogicalPlan(FromArrow(tables, metadata_schema), context)
+    return MaterializedDataset(logical_plan, context, stats)
 
 
 @PublicAPI(stability="alpha")
