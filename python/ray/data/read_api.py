@@ -1310,6 +1310,9 @@ def read_parquet(
                 "path. Use `ray.data.read_parquet(path).select_columns([...])` "
                 "instead."
             )
+        # ``filter=`` is deprecated (warning emitted above) and silently
+        # dropped on the V2 path — callers should use ``.filter(expr=...)``.
+        arrow_parquet_args.pop("filter", None)
 
         from ray.data._internal.datasource_v2.parquet_datasource_v2 import (
             ParquetDatasourceV2,
