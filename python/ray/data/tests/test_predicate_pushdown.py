@@ -5,6 +5,7 @@ from typing import Any, List
 import lance
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 from packaging.version import Version, parse as version_parse
@@ -1007,6 +1008,89 @@ class TestPyArrowComputeUDFPushdown:
         assert not plan_has_operator(
             optimized_plan, Filter
         ), "Complex-type UDF filter should be pushed into Read"
+
+
+class TestOpaqueUDFBlocksPushdown:
+    """Tests that opaque @udf predicates are NOT pushed into Read operators.
+
+    Plain ``UDFExpr`` nodes (created by ``@udf``) cannot be converted to
+    PyArrow expressions.  Pushing them into a Parquet (or other file-based)
+    datasource crashes at read time with ``TypeError: UDF expressions cannot
+    be converted to PyArrow expressions``.
+
+    Regression tests for https://github.com/ray-project/ray/issues/63761
+    """
+
+    def test_opaque_udf_filter_not_pushed_into_parquet(
+        self, ray_start_regular_shared, tmp_path
+    ):
+        """An @udf predicate on Parquet must NOT be pushed into Read."""
+        from ray.data.datatype import DataType
+        from ray.data.expressions import udf
+
+        @udf(return_dtype=DataType.bool())
+        def keep_all(value: pa.Array) -> pa.Array:
+            return pa.array([True] * len(value), type=pa.bool_())
+
+        path = str(tmp_path / "data.parquet")
+        pq.write_table(
+            pa.table({"value": pa.array([1, 2, 3, 4, 5], type=pa.int64())}),
+            path,
+        )
+
+        ds = ray.data.read_parquet(path).filter(expr=keep_all(col("value")))
+
+        # The filter must remain as a separate operator — not absorbed into Read.
+        optimized_plan = LogicalOptimizer().optimize(ds._logical_plan)
+        assert plan_has_operator(optimized_plan, Filter), (
+            "Opaque @udf filter must NOT be pushed into Read; "
+            f"plan: {optimized_plan.dag.dag_str}"
+        )
+
+        # Execution must succeed (no TypeError).
+        result = ds.take_all()
+        assert len(result) == 5
+
+    def test_mixed_opaque_udf_and_comparison_splits(
+        self, ray_start_regular_shared, tmp_path
+    ):
+        """AND of an opaque UDF and a comparison: comparison pushes, UDF stays."""
+        from ray.data.datatype import DataType
+        from ray.data.expressions import udf
+
+        @udf(return_dtype=DataType.bool())
+        def is_even(value: pa.Array) -> pa.Array:
+            return pc.equal(pc.bit_wise_and(value, pa.scalar(1, pa.int64())), 0)
+
+        path = str(tmp_path / "data.parquet")
+        pq.write_table(
+            pa.table({"value": pa.array(range(10), type=pa.int64())}),
+            path,
+        )
+
+        ds = ray.data.read_parquet(path).filter(
+            expr=is_even(col("value")) & (col("value") > 3)
+        )
+
+        optimized_plan = LogicalOptimizer().optimize(ds._logical_plan)
+
+        # The opaque UDF conjunct must remain as a Filter.
+        residual_filters = get_operators_of_type(optimized_plan, Filter)
+        assert len(residual_filters) == 1, (
+            "Opaque UDF conjunct should remain as a residual Filter; "
+            f"plan: {optimized_plan.dag.dag_str}"
+        )
+
+        # The residual should contain the UDF but NOT the comparison.
+        residual_str = str(residual_filters[0].predicate_expr)
+        assert (
+            "is_even" in residual_str
+        ), f"Residual filter should contain opaque UDF, got: {residual_str}"
+
+        # Execution must succeed and produce correct results.
+        result = ds.take_all()
+        expected_values = [v for v in range(10) if v % 2 == 0 and v > 3]
+        assert sorted(r["value"] for r in result) == expected_values
 
 
 class TestPushIntoBranchesBehavior:

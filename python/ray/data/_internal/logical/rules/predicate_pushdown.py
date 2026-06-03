@@ -23,12 +23,10 @@ from ray.data._internal.logical.operators import (
 )
 from ray.data._internal.planner.plan_expression.expression_visitors import (
     _ColumnSubstitutionVisitor,
+    contains_non_pushdownable_udf,
+    split_conjuncts,
 )
 from ray.data.expressions import Expr, col
-
-__all__ = [
-    "PredicatePushdown",
-]
 
 
 class PredicatePushdown(Rule):
@@ -198,18 +196,38 @@ class PredicatePushdown(Rule):
         # by an ``AliasExpr`` in a ``Project`` operator above the read), so
         # the predicate above the read is already in the same column
         # namespace the scanner sees — no rebinding is required here.
+        #
+        # When the predicate contains opaque UDFs (plain ``UDFExpr`` nodes
+        # created by ``@udf``), only the pushable conjuncts are sent to
+        # the datasource; opaque parts stay as a residual ``Filter``.
         if (
             isinstance(input_op, LogicalOperatorSupportsPredicatePushdown)
             and input_op.supports_predicate_pushdown()
         ):
-            result_op = input_op.apply_predicate(predicate_expr)
+            split = split_conjuncts(
+                predicate_expr,
+                is_pushable=lambda e: not contains_non_pushdownable_udf(e),
+            )
 
-            # If the operator is unchanged (e.g., predicate references partition columns
-            # that can't be pushed down), keep the Filter operator
-            if result_op is input_op:
-                return filter_op
+            if split.pushable is None:
+                # Nothing is pushable (entire predicate is opaque).
+                # Fall through to Case 2 / return the original filter.
+                pass
+            else:
+                result_op = input_op.apply_predicate(split.pushable)
 
-            return result_op
+                # If the operator is unchanged (e.g., predicate references
+                # partition columns that can't be pushed down), keep the
+                # Filter operator.
+                if result_op is input_op:
+                    return filter_op
+
+                if split.residual is not None:
+                    return Filter(
+                        predicate_expr=split.residual,
+                        input_dependencies=[result_op],
+                    )
+                return result_op
 
         # Case 2: Check if operator allows predicates to pass through
         if isinstance(input_op, LogicalOperatorSupportsPredicatePassThrough):

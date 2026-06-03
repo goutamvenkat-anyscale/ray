@@ -1,5 +1,5 @@
-from dataclasses import replace
-from typing import Dict, List, TypeVar
+from dataclasses import dataclass, replace
+from typing import Callable, Dict, List, Optional, TypeVar
 
 from ray.data.expressions import (
     AliasExpr,
@@ -10,6 +10,7 @@ from ray.data.expressions import (
     LiteralExpr,
     MonotonicallyIncreasingIdExpr,
     Operation,
+    PyArrowComputeUDFExpr,
     RandomExpr,
     StarExpr,
     UDFExpr,
@@ -173,6 +174,38 @@ class _CallableClassUDFCollector(_ExprVisitorBase):
 
         # Continue visiting child expressions
         super().visit_udf(expr)
+
+
+class _NonPushdownableUDFDetector(_ExprVisitorBase):
+    """Visitor that detects UDFExprs that cannot be converted to PyArrow.
+
+    A ``UDFExpr`` is pushdownable only if it is a ``PyArrowComputeUDFExpr``.
+    Plain ``UDFExpr`` nodes (including ``@udf``-decorated functions) are opaque
+    to PyArrow and must not be pushed into file-based datasources.
+    """
+
+    def __init__(self):
+        self._found = False
+
+    @property
+    def found(self) -> bool:
+        return self._found
+
+    def visit_column(self, expr: ColumnExpr) -> None:
+        pass
+
+    def visit_udf(self, expr: UDFExpr) -> None:
+        if not isinstance(expr, PyArrowComputeUDFExpr):
+            self._found = True
+            return
+        super().visit_udf(expr)
+
+
+def contains_non_pushdownable_udf(expr: Expr) -> bool:
+    """Return True if *expr* contains any UDF that cannot be converted to PyArrow."""
+    detector = _NonPushdownableUDFDetector()
+    detector.visit(expr)
+    return detector.found
 
 
 class _ColumnSubstitutionVisitor(_ExprVisitor[Expr]):
@@ -577,6 +610,68 @@ class _InlineExprReprVisitor(_ExprVisitor[str]):
     def visit_uuid(self, expr: "UUIDExpr") -> str:
         """Visit a uuid expression and return its inline representation."""
         return "uuid()"
+
+
+@dataclass
+class ConjunctSplit:
+    """Result of splitting a predicate's AND-chain into two buckets.
+
+    Attributes:
+        pushable: Conjuncts safe to push down (to a datasource / scanner),
+            or ``None`` if none were found.
+        residual: Conjuncts that must stay as a ``Filter`` above the
+            push-down target, or ``None`` if none were found.
+
+    ANDing ``pushable`` and ``residual`` (skipping ``None`` values)
+    reproduces the original predicate.
+    """
+
+    pushable: Optional[Expr]
+    residual: Optional[Expr]
+
+
+def split_conjuncts(
+    predicate: Expr,
+    is_pushable: Callable[[Expr], bool],
+) -> ConjunctSplit:
+    """Split a predicate's AND-chain into pushable and residual buckets.
+
+    Walks the top-level ``AND`` chain.  Each leaf conjunct (a non-``AND``
+    node) is classified by *is_pushable*:
+
+    - ``True``  → pushable bucket (can be sent to a datasource / scanner).
+    - ``False`` → residual bucket (must stay as a ``Filter`` above).
+
+    An ``OR`` or other non-``AND`` node is never split further; it is
+    classified as a single unit.
+
+    Args:
+        predicate: Root expression to split.
+        is_pushable: Classifier called on each leaf conjunct.
+            Receives a single ``Expr`` and returns ``True`` when that
+            conjunct is safe to push down.
+
+    Returns:
+        A :class:`ConjunctSplit` whose ``pushable`` / ``residual`` fields
+        may each be ``None`` when the corresponding bucket is empty.
+    """
+    if isinstance(predicate, BinaryExpr) and predicate.op == Operation.AND:
+        left = split_conjuncts(predicate.left, is_pushable)
+        right = split_conjuncts(predicate.right, is_pushable)
+
+        def _combine(a: Optional[Expr], b: Optional[Expr]) -> Optional[Expr]:
+            if a is not None and b is not None:
+                return a & b
+            return a or b
+
+        return ConjunctSplit(
+            pushable=_combine(left.pushable, right.pushable),
+            residual=_combine(left.residual, right.residual),
+        )
+
+    if is_pushable(predicate):
+        return ConjunctSplit(pushable=predicate, residual=None)
+    return ConjunctSplit(pushable=None, residual=predicate)
 
 
 def get_column_references(expr: Expr) -> List[str]:
